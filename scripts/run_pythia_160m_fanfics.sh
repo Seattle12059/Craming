@@ -4,15 +4,19 @@
 set -e
 
 # Define the arguments
-MODEL_NAME="meta-llama/Meta-Llama-3.1-8B"
-DTYPE="bfloat16"
-USE_FLASH_ATTENTION_2=true
-N_MEM_TOKENS=(1)
-MAX_LENGTH=(2560) #(2048 3072) #(64 128 512 1024) #(8 16 32 64 96 128 192 256 384 512 768 1024 1280 1568 2048 3072)
+MODEL_NAME="EleutherAI/pythia-160m"
+DTYPE="float32"
+USE_FLASH_ATTENTION_2=false
+N_MEM_TOKENS=(1) # (2 4 8 16 32 64 128) #(1 2 4 8 16 32 64 128)
+MAX_LENGTH=(8 16 32 64 80 96 128 192 256 384 512)
 NUM_ITERATIONS=5000
 NUM_SAMPLES=50
 LR=1e-2
 WEIGHT_DECAY=0.01
+
+TEXTS_PATH=./data/fanfics_1k_chunks.csv
+SAVE_PATH=./runs_fanfics
+
 
 # Run the Python script with the arguments
 python train.py \
@@ -24,4 +28,6 @@ python train.py \
     --num_iterations "$NUM_ITERATIONS" \
     --num_samples "$NUM_SAMPLES" \
     --lr "$LR" \
-    --weight_decay "$WEIGHT_DECAY"
+    --weight_decay "$WEIGHT_DECAY" \
+    --texts_path "$TEXTS_PATH" \
+    --save_path "$SAVE_PATH"
