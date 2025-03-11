@@ -30,6 +30,30 @@ Our experiments show that a single Llama-3.1-8B input vector can compress and su
 - `notebooks/plot_length_vs_n_mem_tokens.ipynb` - Figure 4, scaling compression and number of trainable `[mem]` vectors.
 - `notebooks/plot_model_theor_capacity_vs_actual.ipynb` - Figure 5, Theoretical capacity vs empirical.
 
+## Data
+### Downloading Preprocessed Data
+
+To quickly get started, you can download our preprocessed text chunks for PG-19 and fanfics with a single command:
+
+```bash
+cd ./data
+./download_texts.sh
+```
+
+This script will fetch the required texts and place them in the `./data` folder.
+
+
+### Rebuilding the Data from Source
+If you would like to preprocess the text chunks yourself or modify the process:
+
+- **PG-19**: The [preprocess_pg19.ipynb](./notebooks/preprocess_pg19.ipynb) notebook shows how we build text chunks from the original PG-19 corpus.
+- **Fanfics**: The [preprocess_fanfics.ipynb](./notebooks/preprocess_fanfics.ipynb) notebook shows how we cleaned and preprocessed HTML fanfic data. The list of the fanfic URLs is in [fanfics_urls.txt](./data/fanfics_urls.txt).
+- **Random Texts**: We generate random texts from the GloVe vocabulary. The script [make_vocab.py](./make_vocab.py) extracts the top 100k words from `glove.6B.50d.txt`:
+
+```bash
+python make_vocab.py --glove_path ./glove.6B/glove.6B.50d.txt --vocab_size 100000 --output_path ./data/vocab_100k.txt
+```
+
 ## Citation
 ```
 @misc{kuratov2025cramming,
