@@ -1,5 +1,15 @@
 # To download the data use `bash data/download_texts.sh`
 
+# Script results:
+# Lib: mean, std
+# zlib compression ratio: 0.40, 0.02
+# bz2 compression ratio: 0.34, 0.02
+# lzma compression ratio: 0.37, 0.02
+# Num bits per doc: 375745.73, 96505.98
+# Full-text zlib compression ratio: 0.38
+# Full-text bz2 compression ratio: 0.29
+# Full-text lzma compression ratio: 0.13
+
 import bz2
 from collections import Counter
 import heapq
