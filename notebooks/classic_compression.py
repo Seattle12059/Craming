@@ -2,6 +2,7 @@
 # Run EXACTRLY from the root directory of the project not from the notebooks folder
 
 # Script results:
+# === dataset: pg19_valid_1k_chunks.csv ===
 # Lib: mean, std
 # zlib compression ratio: 0.40, 0.02
 # bz2 compression ratio: 0.34, 0.02
@@ -10,6 +11,26 @@
 # Full-text zlib compression ratio: 0.38
 # Full-text bz2 compression ratio: 0.29
 # Full-text lzma compression ratio: 0.13
+
+# === dataset: fanfics_1k_chunks.csv ===
+# Lib: mean, std
+# zlib compression ratio: 0.38, 0.02
+# bz2 compression ratio: 0.32, 0.02
+# lzma compression ratio: 0.36, 0.02
+# Num bits per doc: 387408.02, 84190.47
+# Full-text zlib compression ratio: 0.36
+# Full-text bz2 compression ratio: 0.25
+# Full-text lzma compression ratio: 0.06
+
+# === dataset: random ===
+# Lib: mean, std
+# zlib compression ratio: 0.56, 0.03
+# bz2 compression ratio: 0.52, 0.05
+# lzma compression ratio: 0.55, 0.07
+# Num bits per doc: 249217.43, 150267.96
+# Full-text zlib compression ratio: 0.52
+# Full-text bz2 compression ratio: 0.41
+# Full-text lzma compression ratio: 0.36
 
 import bz2
 from collections import Counter
