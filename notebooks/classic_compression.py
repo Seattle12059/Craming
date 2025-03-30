@@ -1,4 +1,5 @@
 # To download the data use `bash data/download_texts.sh`
+# Run EXACTRLY from the root directory of the project not from the notebooks folder
 
 # Script results:
 # Lib: mean, std
@@ -21,7 +22,20 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+
+def get_random_text(max_length=1568):
+    vocab = []
+    with open('./data/vocab_100k.txt') as fin:
+        for line in fin:
+            vocab += [line.strip()]
+    cur_max_length = np.random.randint(2, max_length+1)
+    return ' '.join(np.random.choice(vocab, size=cur_max_length * 5))
+
 def get_data(path):
+    if path == 'random':
+        n_docs = 1000
+        return [get_random_text() for _ in range(n_docs)]
+
     df = pd.read_csv(path, index_col=0)
     samples = df['text']
     texts = []
@@ -96,41 +110,44 @@ def example_huffman_compress():
 
 
 if __name__ == '__main__':
-    texts = get_data('pg19_valid_1k_chunks.csv')
+    for dataset in ['pg19_valid_1k_chunks.csv', 'fanfics_1k_chunks.csv', 'random']:
+        print(f'=== dataset: {dataset} ===')
+        texts = get_data(dataset)
 
-    ratios_zlib = []
-    ratios_bz2 = []
-    ratios_lzma = []
-    num_bits_list = []
-    for s in tqdm(texts):
-        data = s.encode('utf-8')
-        num_bits_list.append(len(data) * 8)
-        compressed_zlib = zlib.compress(data)
-        ratio_zlib = len(compressed_zlib) / len(data)
-        ratios_zlib.append(ratio_zlib)
-        # bz2
-        compressed_bz2 = bz2.compress(data)
-        ratio_bz2 = len(compressed_bz2) / len(data)
-        ratios_bz2.append(ratio_bz2)
+        ratios_zlib = []
+        ratios_bz2 = []
+        ratios_lzma = []
+        num_bits_list = []
+        for s in tqdm(texts):
+            data = s.encode('utf-8')
+            num_bits_list.append(len(data) * 8)
+            compressed_zlib = zlib.compress(data)
+            ratio_zlib = len(compressed_zlib) / len(data)
+            ratios_zlib.append(ratio_zlib)
+            # bz2
+            compressed_bz2 = bz2.compress(data)
+            ratio_bz2 = len(compressed_bz2) / len(data)
+            ratios_bz2.append(ratio_bz2)
 
+            # lzma
+            compressed_lzma = lzma.compress(data)
+            ratio_lzma = len(compressed_lzma) / len(data)
+            ratios_lzma.append(ratio_lzma)
+
+        print('Lib: mean, std')
+        print("zlib compression ratio:", f'{np.mean(ratios_zlib):.2f}, {np.std(ratios_zlib):.2f}')
+        print("bz2 compression ratio:", f'{np.mean(ratios_bz2):.2f}, {np.std(ratios_bz2):.2f}')
+        print("lzma compression ratio:", f'{np.mean(ratios_lzma):.2f}, {np.std(ratios_lzma):.2f}')
+        print('Num bits per doc:', f'{np.mean(num_bits_list):.2f}, {np.std(num_bits_list):.2f}')
+
+        full_text = '\n'.join(texts).encode('utf-8')
+        compressed_zlib = zlib.compress(full_text)
+        ratio_zlib = len(compressed_zlib) / len(full_text)
+        print("Full-text zlib compression ratio:", f'{ratio_zlib:.2f}')
+        compressed_bz2 = bz2.compress(full_text)
+        ratio_bz2 = len(compressed_bz2) / len(full_text)
+        print("Full-text bz2 compression ratio:", f'{ratio_bz2:.2f}')
         # lzma
-        compressed_lzma = lzma.compress(data)
-        ratio_lzma = len(compressed_lzma) / len(data)
-        ratios_lzma.append(ratio_lzma)
-    print('Lib: mean, std')
-    print("zlib compression ratio:", f'{np.mean(ratios_zlib):.2f}, {np.std(ratios_zlib):.2f}')
-    print("bz2 compression ratio:", f'{np.mean(ratios_bz2):.2f}, {np.std(ratios_bz2):.2f}')
-    print("lzma compression ratio:", f'{np.mean(ratios_lzma):.2f}, {np.std(ratios_lzma):.2f}')
-    print('Num bits per doc:', f'{np.mean(num_bits_list):.2f}, {np.std(num_bits_list):.2f}')
-
-    full_text = '\n'.join(texts).encode('utf-8')
-    compressed_zlib = zlib.compress(full_text)
-    ratio_zlib = len(compressed_zlib) / len(full_text)
-    print("Full-text zlib compression ratio:", f'{ratio_zlib:.2f}')
-    compressed_bz2 = bz2.compress(full_text)
-    ratio_bz2 = len(compressed_bz2) / len(full_text)
-    print("Full-text bz2 compression ratio:", f'{ratio_bz2:.2f}')
-    # lzma
-    compressed_lzma = lzma.compress(full_text)
-    ratio_lzma = len(compressed_lzma) / len(full_text)
-    print("Full-text lzma compression ratio:", f'{ratio_lzma:.2f}')
+        compressed_lzma = lzma.compress(full_text)
+        ratio_lzma = len(compressed_lzma) / len(full_text)
+        print("Full-text lzma compression ratio:", f'{ratio_lzma:.2f}')
