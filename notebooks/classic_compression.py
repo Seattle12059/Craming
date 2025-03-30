@@ -111,17 +111,16 @@ if __name__ == '__main__':
     print("zlib compression ratio:", f'{np.mean(ratios_zlib):.2f}, {np.std(ratios_zlib):.2f}')
     print("bz2 compression ratio:", f'{np.mean(ratios_bz2):.2f}, {np.std(ratios_bz2):.2f}')
     print("lzma compression ratio:", f'{np.mean(ratios_lzma):.2f}, {np.std(ratios_lzma):.2f}')
-    print('Num bits:', f'{np.mean(num_bits_list):.2f}, {np.std(num_bits_list):.2f}')
+    print('Num bits per doc:', f'{np.mean(num_bits_list):.2f}, {np.std(num_bits_list):.2f}')
 
     full_text = '\n'.join(texts).encode('utf-8')
     compressed_zlib = zlib.compress(full_text)
     ratio_zlib = len(compressed_zlib) / len(full_text)
-    print("Full-text zlib compression ratio:", ratio_zlib)
+    print("Full-text zlib compression ratio:", f'{ratio_zlib:.2f}')
     compressed_bz2 = bz2.compress(full_text)
     ratio_bz2 = len(compressed_bz2) / len(full_text)
-    print("Full-text bz2 compression ratio:", ratio_bz2)
-
+    print("Full-text bz2 compression ratio:", f'{ratio_bz2:.2f}')
     # lzma
     compressed_lzma = lzma.compress(full_text)
     ratio_lzma = len(compressed_lzma) / len(full_text)
-    print("Full-text lzma compression ratio:", ratio_lzma)
+    print("Full-text lzma compression ratio:", f'{ratio_lzma:.2f}')
