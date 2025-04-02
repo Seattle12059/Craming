@@ -38,7 +38,6 @@
 
 import bz2
 from collections import Counter
-import heapq
 import lzma
 import zlib
 
@@ -57,6 +56,7 @@ def get_random_text(max_length=1568):
     cur_max_length = np.random.randint(2, max_length+1)
     return ' '.join(np.random.choice(vocab, size=cur_max_length * 5))
 
+
 def get_data(path, max_text_length):
     if path == 'random':
         n_docs = 1000
@@ -73,69 +73,6 @@ def get_data(path, max_text_length):
         suffix_text = ' '.join(word_tokenize(suffix_text)[:max_text_length])
         texts.append(suffix_text)
     return texts
-
-def huffman_code_for_frequencies(frequencies):
-    """
-Create a Huffman code dictionary {symbol: code} given symbol frequencies.
-    """
-    heap = []
-    for symbol, freq in frequencies.items():
-        # Each entry on the heap is (freq, unique_id, tree_node)
-        # The 'unique_id' ensures no tie-breaking errors in Python's heap
-        heap.append((freq, len(heap), symbol))
-    heapq.heapify(heap)
-
-    # Build Huffman tree
-    while len(heap) > 1:
-        freq1, _, left = heapq.heappop(heap)
-        freq2, _, right = heapq.heappop(heap)
-        new_node = (left, right)
-        new_freq = freq1 + freq2
-        heapq.heappush(heap, (new_freq, len(heap), new_node))
-
-    # Only one element remains
-    _, _, root = heap[0]
-
-    # Traverse tree to get codes
-    code_dict = {}
-
-    def traverse(node, prefix):
-        if isinstance(node, tuple):
-            left, right = node
-            traverse(left, prefix + "0")
-            traverse(right, prefix + "1")
-        else:
-            code_dict[node] = prefix
-
-    traverse(root, "")
-    return code_dict
-
-def huffman_encode(data, code_dict):
-    """
-    Encodes data using a Huffman code dictionary.
-    Returns the bitstring or bit length.
-    """
-    encoded_bits = "".join(code_dict[symbol] for symbol in data)
-    return encoded_bits
-
-
-def example_huffman_compress():
-    data = "this is a sample text to compress"
-    freq = Counter(data)
-
-    # Create Huffman codes from frequencies
-    code_dict = huffman_code_for_frequencies(freq)
-
-    # Encode
-    encoded = huffman_encode(data, code_dict)
-
-    # Calculate compression ratio (bits vs. original ASCII bits)
-    original_bits = len(data) * 8
-    compressed_bits = len(encoded)
-
-    print("Original size (bits):", original_bits)
-    print("Huffman-encoded size (bits):", compressed_bits)
-    print("Compression ratio:", compressed_bits / original_bits)
 
 
 if __name__ == '__main__':
