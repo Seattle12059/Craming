@@ -1,5 +1,6 @@
 # To download the data use `bash data/download_texts.sh`
 # Run EXACTRLY from the root directory of the project not from the notebooks folder
+# for huffman install:  pip install dahuffman
 # python ./notebooks/classic_compression.py
 
 # Script results:
@@ -9,6 +10,7 @@
 # zlib compression ratio: 2.28+-0.16
 # bz2 compression ratio: 2.46+-0.16
 # lzma compression ratio: 2.28+-0.16
+# huffman compression ratio: 1.81+-0.07
 # Num bits per doc: 61965.40+-3451.04
 # Full-text zlib compression ratio: 2.61
 # Full-text bz2 compression ratio: 3.64
@@ -18,6 +20,7 @@
 # zlib compression ratio: 2.34+-0.07
 # bz2 compression ratio: 2.56+-0.09
 # lzma compression ratio: 2.33+-0.07
+# huffman compression ratio: 1.86+-0.04
 # Num bits per doc: 59798.30+-1812.28
 # Full-text zlib compression ratio: 2.79
 # Full-text bz2 compression ratio: 4.17
@@ -25,9 +28,10 @@
 # === dataset: random ===
 # Lib: mean+-std
 # zlib compression ratio: 1.80+-0.06
-# bz2 compression ratio: 1.94+-0.11
-# lzma compression ratio: 1.86+-0.13
-# Num bits per doc: 253956.73+-142617.10
+# bz2 compression ratio: 1.94+-0.12
+# lzma compression ratio: 1.85+-0.13
+# huffman compression ratio: 1.77+-0.01
+# Num bits per doc: 256391.56+-147139.04
 # Full-text zlib compression ratio: 1.93
 # Full-text bz2 compression ratio: 2.47
 # Full-text lzma compression ratio: 2.79
@@ -42,6 +46,7 @@ from nltk import sent_tokenize, word_tokenize
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from dahuffman import HuffmanCodec
 
 
 def get_random_text(max_length=1568):
@@ -140,9 +145,13 @@ if __name__ == '__main__':
         print(f'=== dataset: {dataset} ===')
         texts = get_data(dataset, max_text_length)
 
+        char_freqs = Counter(' '.join(texts))
+        huffman_codec = HuffmanCodec.from_frequencies(char_freqs)
+
         ratios_zlib = []
         ratios_bz2 = []
         ratios_lzma = []
+        ratios_huffman = []
         num_bits_list = []
         for s in tqdm(texts):
             data = s.encode('utf-8')
@@ -160,10 +169,16 @@ if __name__ == '__main__':
             ratio_lzma = len(data) / len(compressed_lzma)
             ratios_lzma.append(ratio_lzma)
 
+            # huffman
+            compressed_huffman = huffman_codec.encode(s)
+            ratio_huffman = len(data) / len(compressed_huffman)
+            ratios_huffman.append(ratio_huffman)
+
         print('Lib: mean+-std')
         print("zlib compression ratio:", f'{np.mean(ratios_zlib):.2f}+-{np.std(ratios_zlib):.2f}')
         print("bz2 compression ratio:", f'{np.mean(ratios_bz2):.2f}+-{np.std(ratios_bz2):.2f}')
         print("lzma compression ratio:", f'{np.mean(ratios_lzma):.2f}+-{np.std(ratios_lzma):.2f}')
+        print("huffman compression ratio:", f'{np.mean(ratios_huffman):.2f}+-{np.std(ratios_huffman):.2f}')
         print('Num bits per doc:', f'{np.mean(num_bits_list):.2f}+-{np.std(num_bits_list):.2f}')
 
         full_text = '\n'.join(texts).encode('utf-8')
