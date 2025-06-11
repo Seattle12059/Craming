@@ -1,11 +1,12 @@
 # Exploring Language Models Embeddings Space Capacity
 
-This repository contains code and notebooks used to make plots for the paper:
+This repository contains code and notebooks used in experiments and to make plots for the paper:
 
-Kuratov, Y., Arkhipov, M., Bulatov, A., Burtsev, M., "Cramming 1568 Tokens into a Single Vector and Back Again: Exploring the Limits of Embedding Space Capacity"
+Kuratov, Y., Arkhipov, M., Bulatov, A., Burtsev, M., "Cramming 1568 Tokens into a Single Vector and Back Again: Exploring the Limits of Embedding Space Capacity", ACL 2025.
+
+This work was done in collaboration of AIRI, DeepPavlov.ai, and London Institute for Mathematical Sciences.
 
 Our experiments show that a single Llama-3.1-8B input vector can compress and subsequently decode text sequences of over 1,500 tokens. Moreover, this capacity increases nearly linearly when multiple vectors are used.
-
 
 <p align="center">
   <img src="./notebooks/imgs/compression_schema.png" width="45%" />
@@ -16,9 +17,15 @@ Our experiments show that a single Llama-3.1-8B input vector can compress and su
 
 **Right**: How many tokens fit into a single input vector? We estimate maximum number of tokens that can be decoded from a single input vector across various language models
 
+## Updates
+- **5 Jun 2025**: Released [v2](https://arxiv.org/abs/2506.02610v2), the camera-ready version of the paper accepted to **ACL 2025** (main track). Added results for Mamba (130m, 370m, 790m, 1.4b) models and added the discussion of how our work relates to entropy coders
+- **15 May 2025**: Our paper was accepted to **ACL 2025** (main track)!
+- **18 Feb 2025**: Released the arXiv preprint [v1](https://arxiv.org/abs/2502.13063v1)
+
 ## Python scripts
 - `train.py` - implements training loop for text compression into a vector.
 - `model.py` - implementation of wrapper that adds trainable input vectors referred as `[mem]` to any model from HF, it is based on Recurrent Memory Transformer (RMT) [implementation](https://github.com/booydar/recurrent-memory-transformer).
+
 
 ## Scripts
 - `scripts/run.*.sh` - bash scripts for different models, they include running experiments on PG-19, fanfics, and random texts with single or multiple trainable input `[mem]` vectors.
@@ -29,6 +36,7 @@ Our experiments show that a single Llama-3.1-8B input vector can compress and su
 - `notebooks/plot_length_model_brief.ipynb` - Figure 1, text compression results on PG-19.
 - `notebooks/plot_length_vs_n_mem_tokens.ipynb` - Figure 4, scaling compression and number of trainable `[mem]` vectors.
 - `notebooks/plot_model_theor_capacity_vs_actual.ipynb` - Figure 5, Theoretical capacity vs empirical.
+- notebooks with `add_mamba` suffix add results for Mamba (130m, 370m, 790m, 1.4b) models.
 
 ## Data
 ### Downloading Preprocessed Data
