@@ -14,7 +14,7 @@ NUM_SAMPLES=50
 LR=1e-2
 WEIGHT_DECAY=0.01
 
-Run the Python script with the arguments
+# Run the Python script with the arguments
 python train.py \
     --model_name "$MODEL_NAME" \
     --dtype "$DTYPE" \
