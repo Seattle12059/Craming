@@ -794,3 +794,23 @@ python eval_nq_memtoken.py \
 (3) With 1 mem     : EM=12.0  F1=21.8  (mem QA，仅统计)
 Saving CSV -> preds_nq_llama8b_mem1.csv
 Saved JSONL -> preds_nq_llama8b_mem1.jsonl
+
+
+python eval_nq_memtoken.py \
+  --model /home/syt/project/Cram/model/model_scope_model/llama3_1_8b_instruct \
+  --n 100 \
+  --split test \
+  --temperature 0.0 \
+  --max_new_tokens 16 \
+  --csv_out preds_nq_llama8b_mem1.csv \
+  --save_preds preds_nq_llama8b_mem1.jsonl \
+  --device cuda \
+  --verbose \
+  --mem_len 1 \
+  --mem_steps 1000 \
+  --mem_lr 1e-2 --mem_wd 1e-2 --mem_beta1 0.9 --mem_beta2 0.9 \
+  --mem_target_acc 1.0 --mem_log_every 50 \
+  --max_ctx_tokens 1024 \
+  --ctx_window keyword \
+  --enable_gc \
+  --use_ae

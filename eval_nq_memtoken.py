@@ -1,8 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, csv, json, re, string, random
-from typing import List, Tuple
+"""
+改动要点（相对原始脚本）：
+① 增加“AE token”（共享的、数据集级别，只训练一个），用于学习“复述 mem 内容”的隐式指令；
+   - 训练阶段输入顺序：[mem] + [ae] + embed(ctx)
+   - 标签：对 [mem] 和 [ae] 位置不计损失，仅监督重建 ctx
+   - QA 阶段仅使用：[mem] + embed(prompt) ；**不再拼接 AE**（实现“指令/内容解耦”）
+   - AE token 在整个数据集上共享且持续被优化；每条样本仍各自训练专属 mem token
+② 增加日志/结果目录：每次运行创建新的 run 目录，所有输出（CSV/JSONL/日志/配置/AE 权重）统一保存
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+import string
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Optional, Callable
 
 import torch
 import torch.nn as nn
@@ -16,18 +34,23 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 _ARTICLES = {"a", "an", "the"}
 
 def white_space_fix(s): return " ".join(s.split())
+
 def remove_articles(s): return " ".join([w for w in s.split() if w not in _ARTICLES])
+
 def remove_punc(s):
     tbl = str.maketrans("", "", string.punctuation)
     return s.translate(tbl)
+
 def lower(s): return s.lower()
+
 
 def normalize_answer(s: str) -> str:
     if s is None: return ""
     s = s.strip()
-    s = re.sub(r'^[\"\'`\-–—\(\[]+|[\"\'`\-–—\)\]]+$', "", s)
+    s = re.sub(r'^[\"\'""`\-–—\(\[]+|[\"\'""`\-–—\)\]]+$', "", s)
     s = s.replace("U.S.", "US").replace("U.K.", "UK")
     return white_space_fix(remove_articles(remove_punc(lower(s))))
+
 
 def f1_score(prediction: str, ground_truth: str) -> float:
     pred_tokens = normalize_answer(prediction).split()
@@ -45,6 +68,7 @@ def f1_score(prediction: str, ground_truth: str) -> float:
     recall = 1.0 * num_same / len(gold_tokens)
     return 2 * precision * recall / (precision + recall)
 
+
 def metric_em_f1(pred: str, gold_list: List[str]) -> Tuple[float, float]:
     if not gold_list: return 0.0, 0.0
     em = max(float(normalize_answer(pred) == normalize_answer(g)) for g in gold_list)
@@ -55,6 +79,7 @@ def metric_em_f1(pred: str, gold_list: List[str]) -> Tuple[float, float]:
 # Prompt helpers
 # =========================
 SYS_PROMPT = "You are a helpful, concise QA assistant."
+
 
 def build_prompt(tokenizer, question: str, context: str = None) -> str:
     if context:
@@ -76,9 +101,10 @@ def build_prompt(tokenizer, question: str, context: str = None) -> str:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return f"### System:\n{SYS_PROMPT}\n\n### User:\n{user}\n\n### Assistant:"
 
+
 def postprocess_model_answer(text: str) -> str:
     ans = text.strip().splitlines()[0].strip()
-    ans = re.sub(r"^(answer\s*:)\s*", "", ans, flags=re.I)
+    ans = re.sub(r"^(answer\s*: )\s*", "", ans, flags=re.I)
     ans = re.sub(r"[\"“”‘’]+$", "", ans).strip()
     return ans
 
@@ -106,6 +132,7 @@ def generate_answer(model, tokenizer, prompt: str, max_new_tokens=16, temperatur
 # =========================
 # NON-ORACLE span align
 # =========================
+
 def _f1_tokens(pred_tokens, span_tokens):
     common = {}
     for t in span_tokens:
@@ -119,6 +146,7 @@ def _f1_tokens(pred_tokens, span_tokens):
     precision = num_same / len(span_tokens)
     recall = num_same / len(pred_tokens)
     return 2 * precision * recall / (precision + recall)
+
 
 def spanize_to_context(pred: str, context: str, max_len: int = 8) -> str:
     if pred and pred in context:
@@ -140,6 +168,7 @@ def spanize_to_context(pred: str, context: str, max_len: int = 8) -> str:
 # =========================
 # 仅用于 mem 训练的上下文截断（避免 OOM）
 # =========================
+
 def _extract_keywords(q: str) -> List[str]:
     # 取长度>=3的字母数字词，去重
     kws = re.findall(r"[A-Za-z0-9]{3,}", q.lower())
@@ -150,13 +179,14 @@ def _extract_keywords(q: str) -> List[str]:
             seen.add(w); out.append(w)
     return out
 
+
 def truncate_ctx_for_mem_training(
     question: str,
     context: str,
     tokenizer,
     max_ctx_tokens: int,
     mode: str = "keyword",
-    verbose: bool = False
+    verbose: bool = False,
 ):
     """
     只在 mem 训练阶段使用的截断策略：
@@ -197,15 +227,62 @@ def truncate_ctx_for_mem_training(
     return ids_trunc.to(tokenizer.device if hasattr(tokenizer, "device") else "cpu"), info
 
 # =========================
-# ③ 单样本 1×mem token 压缩/重建/QA
+# 共享 AE Token（数据集级别，只训练一个）
 # =========================
+
+class SharedAEToken:
+    """
+    持有一个共享 AE token 参数和其优化器。该 token 旨在学习“复述 mem 内容”的通用指令。
+    - 训练：与每个样本的 mem 一起更新；优化器/参数在整个数据集循环中持续存在
+    - 推理：**不使用 AE**（仅 mem + prompt）
+    """
+    def __init__(
+        self,
+        model: AutoModelForCausalLM,
+        ae_len: int = 1,
+        lr: float = 5e-3,
+        weight_decay: float = 1e-2,
+        beta1: float = 0.9,
+        beta2: float = 0.9,
+    ):
+        self.model = model
+        self.emb = model.get_input_embeddings()
+        hidden = self.emb.embedding_dim
+        self.ae = nn.Parameter(torch.zeros(1, ae_len, hidden, device=model.device, dtype=torch.float32))
+        nn.init.normal_(self.ae, mean=0.0, std=0.02)
+        self.opt = AdamW([
+            {"params": [self.ae], "lr": lr, "weight_decay": weight_decay, "betas": (beta1, beta2)}
+        ])
+
+    @property
+    def ae_len(self) -> int:
+        return int(self.ae.shape[1])
+
+    def cast_like(self, ref: torch.Tensor) -> torch.Tensor:
+        return self.ae.to(dtype=ref.dtype)
+
+    def state_dict(self):
+        return {"ae": self.ae.detach().cpu()}
+
+# =========================
+# ③ 单样本 1×mem token 压缩/重建/QA（支持共享 AE token）
+# =========================
+
 class MemCompressor:
     """
-    冻结模型，仅优化一个 FP32 的 mem 参数；前向拼接前把 mem cast 成模型嵌入 dtype（fp16/bf16）。
-    训练目标：teacher forcing 下重建 context。训练后用 mem + 问题做 QA。
+    冻结模型，仅优化一个样本专属的 FP32 mem 参数；（可选）同时更新**共享** AE token。
+    训练目标：teacher forcing 下重建 context。训练后用 mem + 问题做 QA（**不使用 AE**）。
     支持在训练开始/结束时切换 gradient checkpointing 及 use_cache 以省显存。
     """
-    def __init__(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, mem_len: int = 1, enable_gc: bool = False):
+    def __init__(
+        self,
+        model: AutoModelForCausalLM,
+        tokenizer: AutoTokenizer,
+        mem_len: int = 1,
+        enable_gc: bool = False,
+        shared_ae: Optional[SharedAEToken] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.emb = model.get_input_embeddings()
@@ -215,6 +292,14 @@ class MemCompressor:
         self.enable_gc = enable_gc
         self._saved_train_flag = None
         self._saved_use_cache = None
+        self.shared_ae = shared_ae
+        self.logger = logger
+
+    def _log(self, s: str):
+        if self.logger is not None:
+            self.logger(s)
+        else:
+            print(s)
 
     def _enter_mem_train_mode(self):
         # 启用梯度检查点并关闭缓存以降低显存
@@ -235,36 +320,48 @@ class MemCompressor:
 
     def _build_mem_training_inputs(self, ctx_ids: torch.LongTensor):
         """
-        inputs_embeds = [mem] + embed(ctx_ids)
-        labels        = [-100] + ctx_ids
+        训练拼接：inputs_embeds = [mem] + [ae?] + embed(ctx_ids)
+                 labels        = [-100] + [-100?] + ctx_ids
         """
         ctx_ids = ctx_ids.to(self.model.device)
         T = ctx_ids.shape[0]
         ctx_ids_b = ctx_ids.unsqueeze(0)                # [1, T]
         tok_embeds = self.emb(ctx_ids_b)                # [1, T, H], model dtype
         mem_cast = self.mem.to(dtype=tok_embeds.dtype)  # cast
-        inputs_embeds = torch.cat([mem_cast, tok_embeds], dim=1)  # [1, 1+T, H]
-        labels = torch.cat(
-            [torch.full((1, 1), -100, dtype=torch.long, device=ctx_ids.device), ctx_ids_b],
-            dim=1
-        )
+
+        if self.shared_ae is not None:
+            ae_cast = self.shared_ae.cast_like(tok_embeds)  # [1, L_ae, H]
+            inputs_embeds = torch.cat([mem_cast, ae_cast, tok_embeds], dim=1)
+            mask_len = self.mem.shape[1] + self.shared_ae.ae_len
+        else:
+            inputs_embeds = torch.cat([mem_cast, tok_embeds], dim=1)
+            mask_len = self.mem.shape[1]
+
+        labels = torch.cat([
+            torch.full((1, mask_len), -100, dtype=torch.long, device=ctx_ids.device),
+            ctx_ids_b
+        ], dim=1)
         attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=ctx_ids.device)
         return inputs_embeds, labels, attn
 
-    def train_mem(self,
-                  ctx_ids: torch.LongTensor,
-                  steps: int = 1000,
-                  lr: float = 1e-2,
-                  weight_decay: float = 1e-2,
-                  beta1: float = 0.9,
-                  beta2: float = 0.9,
-                  target_acc: float = 1.0,
-                  log_every: int = 100,
-                  verbose: bool = False):
-        # 冻结模型参数，仅优化 mem
+    def train_mem(
+        self,
+        ctx_ids: torch.LongTensor,
+        steps: int = 1000,
+        lr: float = 1e-2,
+        weight_decay: float = 1e-2,
+        beta1: float = 0.9,
+        beta2: float = 0.9,
+        target_acc: float = 1.0,
+        log_every: int = 100,
+        verbose: bool = False,
+    ):
+        # 冻结模型参数，仅优化 mem；（可选）联动优化共享 AE
         for p in self.model.parameters(): p.requires_grad_(False)
 
-        opt = AdamW([{"params": [self.mem], "lr": lr, "weight_decay": weight_decay, "betas": (beta1, beta2)}])
+        opt_mem = AdamW([
+            {"params": [self.mem], "lr": lr, "weight_decay": weight_decay, "betas": (beta1, beta2)}
+        ])
 
         best_acc = 0.0
         best_mem = None
@@ -272,12 +369,20 @@ class MemCompressor:
         self._enter_mem_train_mode()
         try:
             for step in range(1, steps + 1):
-                opt.zero_grad(set_to_none=True)
+                # Zero grad
+                opt_mem.zero_grad(set_to_none=True)
+                if self.shared_ae is not None:
+                    self.shared_ae.opt.zero_grad(set_to_none=True)
+
                 inputs_embeds, labels, attn = self._build_mem_training_inputs(ctx_ids)
                 outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attn, labels=labels)
                 loss = outputs.loss
                 loss.backward()
-                opt.step()
+
+                # step
+                opt_mem.step()
+                if self.shared_ae is not None:
+                    self.shared_ae.opt.step()
 
                 with torch.no_grad():
                     acc = self.recon_acc(ctx_ids)
@@ -287,11 +392,11 @@ class MemCompressor:
                     best_mem = self.mem.detach().clone()
 
                 if verbose and (step % log_every == 0 or step == 1):
-                    print(f"[mem-train] step {step}/{steps}  loss={loss.item():.4f}  recon_acc={acc*100:.2f}%")
+                    self._log(f"[mem-train] step {step}/{steps}  loss={loss.item():.4f}  recon_acc={acc*100:.2f}%")
 
                 if acc >= target_acc:
                     if verbose:
-                        print(f"[mem-train] early stop at step {step} with recon_acc={acc*100:.2f}%")
+                        self._log(f"[mem-train] early stop at step {step} with recon_acc={acc*100:.2f}%")
                     break
         finally:
             self._exit_mem_train_mode()
@@ -317,6 +422,9 @@ class MemCompressor:
 
     @torch.inference_mode()
     def answer_with_mem(self, prompt: str, max_new_tokens=16, temperature=0.0) -> str:
+        """
+        QA 阶段：只用 [mem] + embed(prompt)。**不使用 AE**。
+        """
         self.model.eval()
         toks = self.tokenizer(prompt, return_tensors="pt")
         input_ids = toks["input_ids"].to(self.model.device)
@@ -340,8 +448,28 @@ class MemCompressor:
         return postprocess_model_answer(text)
 
 # =========================
+# 统一日志器
+# =========================
+
+class SimpleLogger:
+    def __init__(self, log_path: Path):
+        self.f = open(log_path, "w", encoding="utf-8")
+
+    def __call__(self, s: str):
+        print(s)
+        self.f.write(s + "\n")
+        self.f.flush()
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+# =========================
 # Main
 # =========================
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
@@ -370,7 +498,40 @@ def main():
     ap.add_argument("--ctx_window", type=str, default="keyword", choices=["keyword","head"], help="Keyword-centered window or take head")
     ap.add_argument("--enable_gc", action="store_true", help="Enable gradient checkpointing during mem training")
 
+    # NEW: 共享 AE token 参数（数据集级别）
+    ap.add_argument("--use_ae", action="store_true", help="Enable shared AE token during mem training (QA uses mem only)")
+    ap.add_argument("--ae_len", type=int, default=1)
+    ap.add_argument("--ae_lr", type=float, default=5e-3)
+    ap.add_argument("--ae_wd", type=float, default=1e-2)
+    ap.add_argument("--ae_beta1", type=float, default=0.9)
+    ap.add_argument("--ae_beta2", type=float, default=0.9)
+
+    # NEW: 结果目录与日志
+    ap.add_argument("--out_dir_base", type=str, default="runs")
+    ap.add_argument("--run_name", type=str, default=None)
+
     args = ap.parse_args()
+
+    # ========== 结果目录 ==========
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_slug = re.sub(r"[^A-Za-z0-9._-]", "_", Path(args.model).name)
+    run_name = args.run_name or f"{ts}_{model_slug}_n{args.n}_seed{args.seed}"
+    run_dir = Path(args.out_dir_base) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # 统一输出文件路径（全部放 run_dir）
+    csv_path = run_dir / Path(args.csv_out).name
+    jsonl_path = (run_dir / Path(args.save_preds).name) if args.save_preds else None
+    log_path = run_dir / "train.log"
+    cfg_path = run_dir / "config.json"
+    ae_path = run_dir / "ae_token.pt"
+
+    logger = SimpleLogger(log_path)
+    logger(f"[run-dir] {run_dir}")
+
+    # 保存配置
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, ensure_ascii=False, indent=2)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -391,6 +552,19 @@ def main():
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # 共享 AE token（可选）
+    shared_ae = None
+    if args.use_ae:
+        shared_ae = SharedAEToken(
+            model=model,
+            ae_len=args.ae_len,
+            lr=args.ae_lr,
+            weight_decay=args.ae_wd,
+            beta1=args.ae_beta1,
+            beta2=args.ae_beta2,
+        )
+        logger("[init] Shared AE token created.")
+
     header = [
         "context_len_tokens","id","question","context","gold_answers",
         "pred_no_ctx","pred_with_ctx","em_no_ctx","f1_no_ctx","em_with_ctx","f1_with_ctx",
@@ -399,7 +573,7 @@ def main():
 
     em_1 = f1_1 = em_2 = f1_2 = 0.0
     mem_em = mem_f1 = 0.0
-    rows, jsonl = [], ([] if args.save_preds else None)
+    rows, jsonl = [], ([] if jsonl_path is not None else None)
 
     for i, ex in enumerate(ds):
         q = ex["question"]
@@ -422,13 +596,17 @@ def main():
         pred2_span = spanize_to_context(pred2_raw, ctx)
         em2, f12 = metric_em_f1(pred2_span, golds)
 
-        # (3) mem token：仅在训练 mem 时对 context 截断，避免 OOM
+        # (3) mem token：仅在训练 mem 时对 context 截断，避免 OOM；可选共享 AE
         ctx_ids_for_mem, info = truncate_ctx_for_mem_training(
             q, ctx, tokenizer, max_ctx_tokens=args.max_ctx_tokens, mode=args.ctx_window, verbose=args.verbose
         )
         ctx_ids_for_mem = ctx_ids_for_mem.to(model.device)
 
-        compressor = MemCompressor(model, tokenizer, mem_len=args.mem_len, enable_gc=args.enable_gc)
+        compressor = MemCompressor(
+            model, tokenizer,
+            mem_len=args.mem_len, enable_gc=args.enable_gc,
+            shared_ae=shared_ae, logger=logger if args.verbose else None,
+        )
         recon_best = compressor.train_mem(
             ctx_ids=ctx_ids_for_mem,
             steps=args.mem_steps,
@@ -471,30 +649,39 @@ def main():
                 "mem_trunc_info": info,
             })
 
-        # 清理显存碎片
+        # 清理显存碎片（仅在 CUDA 可用时）
         del compressor
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if args.verbose and (i+1) % 10 == 0:
-            print(f"[{i+1}/{args.n}] EM/F1(no-ctx)={em1:.0f}/{f11:.1f}  EM/F1(+ctx)={em2:.0f}/{f12:.1f}  EM/F1(+1mem)={em3:.0f}/{f13:.1f}  recon={recon_best*100:.1f}%")
+            logger(f"[{i+1}/{args.n}] EM/F1(no-ctx)={em1:.0f}/{f11:.1f}  EM/F1(+ctx)={em2:.0f}/{f12:.1f}  EM/F1(+1mem)={em3:.0f}/{f13:.1f}  recon={recon_best*100:.1f}%")
 
     N = max(1, len(rows))
-    print("\n=== Final ===")
-    print(f"(1) No context     : EM={em_1/N*100:.1f}  F1={f1_1/N*100:.1f}")
-    print(f"(2) With gold ctx  : EM={em_2/N*100:.1f}  F1={f1_2/N*100:.1f}")
-    print(f"(3) With 1 mem     : EM={mem_em/N*100:.1f}  F1={mem_f1/N*100:.1f}  (mem QA，仅统计)")
-    print(f"Saving CSV -> {args.csv_out}")
+    logger("\n=== Final ===")
+    logger(f"(1) No context     : EM={em_1/N*100:.1f}  F1={f1_1/N*100:.1f}")
+    logger(f"(2) With gold ctx  : EM={em_2/N*100:.1f}  F1={f1_2/N*100:.1f}")
+    logger(f"(3) With 1 mem     : EM={mem_em/N*100:.1f}  F1={mem_f1/N*100:.1f}  (mem QA，仅统计)")
 
-    with open(args.csv_out, "w", encoding="utf-8", newline="") as f:
+    logger(f"Saving CSV -> {csv_path}")
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
 
-    if jsonl is not None:
-        with open(args.save_preds, "w", encoding="utf-8") as f:
+    if jsonl is not None and jsonl_path is not None:
+        with open(jsonl_path, "w", encoding="utf-8") as f:
             for r in jsonl:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"Saved JSONL -> {args.save_preds}")
+        logger(f"Saved JSONL -> {jsonl_path}")
+
+    # 保存共享 AE 权重
+    if shared_ae is not None:
+        torch.save(shared_ae.state_dict(), ae_path)
+        logger(f"Saved AE token -> {ae_path}")
+
+    logger.close()
+
 
 if __name__ == "__main__":
     main()
