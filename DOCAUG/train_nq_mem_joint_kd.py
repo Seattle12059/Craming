@@ -4,6 +4,13 @@
 """
 NQ 三种模式训练/评测：
 (1) 无上下文；(2) 有金上下文；(3) Mem(联合训练：AE重建+QA问答)，评测仅用原始问题。
+
+更新：
+- 新增 “答案 token 的 Logit 蒸馏 (KD)” 到 QA 分支，teacher 读取 gold context，student 读取 mem。
+- 通过命令行参数控制 KD 温度、权重、前 K 个答案 token 的额外权重、是否启用 KD；
+- mem token 个数仍由 --mem_len 控制。
+- 其余流程保持不变（尽量最小侵入）。
+
 数据：
   --raw_subset_file: data/nq_subset/raw/nq_subset_100.jsonl   # 含原问题
   --aug_file       : data/nq_subset/augmented/nq_multiqa_only_no_unans.jsonl  # 只含新问题
@@ -99,7 +106,7 @@ def build_memqa_prompt(tokenizer, question: str) -> str:
 
 def postprocess_model_answer(text: str) -> str:
     ans = text.strip().splitlines()[0].strip()
-    ans = re.sub(r"^(answer\s*:)\s*", "", ans, flags=re.I)
+    ans = re.sub(r"^(answer\s*: )\s*", "", ans, flags=re.I)
     ans = re.sub(r"[\"“”‘’]+$", "", ans).strip()
     return ans
 
@@ -127,6 +134,7 @@ def generate_answer(model, tokenizer, prompt: str, max_new_tokens=16, temperatur
 # =========================
 # NON-ORACLE span align
 # =========================
+
 def _f1_tokens(pred_tokens, span_tokens):
     common = {}
     for t in span_tokens:
@@ -161,6 +169,7 @@ def spanize_to_context(pred: str, context: str, max_len: int = 8) -> str:
 # =========================
 # 上下文截断（仅用于 mem 训练）
 # =========================
+
 def _extract_keywords(q: str) -> List[str]:
     kws = re.findall(r"[A-Za-z0-9]{3,}", q.lower())
     seen = set(); out = []
@@ -206,8 +215,9 @@ def truncate_ctx_for_mem_training(
     return ids_trunc.to("cpu"), info
 
 # =========================
-# ③ Mem：联合训练 AE + QA
+# ③ Mem：联合训练 AE + QA (+ 可选 KD)
 # =========================
+
 class MemCompressor:
     def __init__(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, mem_len: int = 1, enable_gc: bool = False):
         self.model = model
@@ -264,14 +274,14 @@ class MemCompressor:
         attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
         return inputs_embeds, labels, attn
 
-    def _sample_qa_pair(self, qa_pairs_ids: List[Tuple[torch.LongTensor, torch.LongTensor]], step: int):
-        if not qa_pairs_ids: return None
-        idx = step % len(qa_pairs_ids)
-        return qa_pairs_ids[idx]
+    def _sample_qa_pair(self, qa_pairs: List[Dict], step: int):
+        if not qa_pairs: return None
+        idx = step % len(qa_pairs)
+        return qa_pairs[idx]
 
     def train_mem(self,
                   ctx_ids: torch.LongTensor,
-                  qa_pairs_ids: Optional[List[Tuple[torch.LongTensor, torch.LongTensor]]] = None,
+                  qa_pairs: Optional[List[Dict]] = None,
                   steps: int = 500,
                   lr: float = 1e-2,
                   weight_decay: float = 1e-2,
@@ -282,9 +292,21 @@ class MemCompressor:
                   mem_l2: float = 1e-4,
                   noise_std: float = 0.0,
                   log_every: int = 100,
-                  verbose: bool = False):
+                  verbose: bool = False,
+                  # KD 相关
+                  enable_kd: bool = False,
+                  context_text: Optional[str] = None,
+                  teacher_model: Optional[AutoModelForCausalLM] = None,
+                  teacher_tokenizer: Optional[AutoTokenizer] = None,
+                  kd_temp: float = 2.0,
+                  kd_lambda: float = 1.0,
+                  kd_first_k: int = 0,
+                  kd_head_weight: float = 1.0,
+                  ):
         for p in self.model.parameters(): p.requires_grad_(False)
         opt = AdamW([{"params": [self.mem], "lr": lr, "weight_decay": weight_decay, "betas": (beta1, beta2)}])
+
+        kl = torch.nn.KLDivLoss(reduction="batchmean")
 
         best_acc = 0.0
         best_mem = None
@@ -305,17 +327,60 @@ class MemCompressor:
 
                 # QA
                 loss_qa = torch.tensor(0.0, device=self.model.device)
-                if qa_pairs_ids:
-                    pair = self._sample_qa_pair(qa_pairs_ids, step)
+                loss_kd = torch.tensor(0.0, device=self.model.device)
+                if qa_pairs:
+                    pair = self._sample_qa_pair(qa_pairs, step)
                     if pair is not None:
-                        pr_ids, ans_ids = pair
+                        pr_ids, ans_ids = pair["pr_ids"], pair["ans_ids"]
                         qa_inp, qa_lab, qa_attn = self._build_mem_qa_inputs(pr_ids, ans_ids)
                         if noise_std > 0:
                             qa_inp[:, :self.mem.shape[1], :] += torch.randn_like(qa_inp[:, :self.mem.shape[1], :]) * noise_std
                         out2 = self.model(inputs_embeds=qa_inp, attention_mask=qa_attn, labels=qa_lab)
                         loss_qa = out2.loss
 
-                loss = alpha * loss_ae + (1 - alpha) * loss_qa + mem_l2 * (self.mem.pow(2).mean())
+                        # ===== KD: 答案 token 的 logit 蒸馏 =====
+                        if enable_kd and (teacher_model is not None) and (teacher_tokenizer is not None) and (context_text is not None) and kd_lambda > 0:
+                            q_text = pair.get("q_text", None)
+                            a_text = pair.get("a_text", None)
+                            if q_text and a_text:
+                                try:
+                                    # 学生答案对齐：取预测答案 token 的对应 logits 切片
+                                    answer_len = ans_ids.shape[0]
+                                    start_pos = self.mem.shape[1] + pr_ids.shape[0] - 1
+                                    logits_s = out2.logits[0, start_pos : start_pos + answer_len, :]  # [Ta, V]
+
+                                    # 老师构造：gold ctx + prompt（span 复制风格） + 答案文本（teacher forcing）
+                                    t_prompt = build_prompt(teacher_tokenizer, q_text, context=context_text)
+                                    t_pr_ids = teacher_tokenizer(t_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0].to(self.model.device)
+                                    t_ans_ids = teacher_tokenizer(a_text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].to(self.model.device)
+                                    t_input_ids = torch.cat([t_pr_ids, t_ans_ids], dim=0).unsqueeze(0)
+                                    with torch.no_grad():
+                                        out_t = teacher_model(input_ids=t_input_ids)
+                                    logits_t_full = out_t.logits[0]
+                                    Tp, Ta = t_pr_ids.shape[0], t_ans_ids.shape[0]
+                                    logits_t = logits_t_full[Tp - 1 : Tp - 1 + Ta, :]  # [Ta, V]
+
+                                    # 温度 KD
+                                    T = kd_temp if kd_temp > 0 else 1.0
+                                    p_t = torch.softmax(logits_t / T, dim=-1)
+                                    log_p_s = torch.log_softmax(logits_s / T, dim=-1)
+                                    base_kd = (T * T) * kl(log_p_s, p_t)
+
+                                    # 首 K 个答案 token 加权
+                                    if kd_first_k > 0 and kd_head_weight != 1.0:
+                                        k = min(kd_first_k, logits_s.shape[0])
+                                        head_kd = (T * T) * kl(log_p_s[:k], p_t[:k])
+                                        loss_kd = base_kd + (kd_head_weight - 1.0) * head_kd
+                                    else:
+                                        loss_kd = base_kd
+                                except Exception as e:
+                                    # 防御性：KD 失败不影响主流程
+                                    if verbose:
+                                        print(f"[warn] KD failed at step {step}: {e}")
+                                    loss_kd = torch.tensor(0.0, device=self.model.device)
+
+                # 总损失
+                loss = alpha * loss_ae + (1 - alpha) * loss_qa + kd_lambda * loss_kd + mem_l2 * (self.mem.pow(2).mean())
                 loss.backward()
                 opt.step()
 
@@ -327,7 +392,7 @@ class MemCompressor:
                     best_mem = self.mem.detach().clone()
 
                 if verbose and (step % log_every == 0 or step == 1):
-                    print(f"[mem-train] step {step}/{steps} alpha={alpha:.2f} loss={loss.item():.4f} AE={loss_ae.item():.4f} QA={loss_qa.item():.4f} recon={acc*100:.2f}%")
+                    print(f"[mem-train] step {step}/{steps} alpha={alpha:.2f} loss={loss.item():.4f} AE={loss_ae.item():.4f} QA={loss_qa.item():.4f} KD={loss_kd.item():.4f} recon={acc*100:.2f}%")
 
         finally:
             self._exit_mem_train_mode()
@@ -377,6 +442,7 @@ class MemCompressor:
 # =========================
 # IO & Pair building
 # =========================
+
 def load_jsonl(path: str) -> List[dict]:
     out = []
     with open(path, "r", encoding="utf-8") as f:
@@ -392,22 +458,11 @@ def load_jsonl(path: str) -> List[dict]:
 def normalize_text_for_key(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip())
 
-def build_memqa_prompt(tokenizer, question: str) -> str:
-    user = (
-        "Answer the question with the shortest exact phrase you can recall. "
-        "If you don't know, output exactly: I don't know.\n\n"
-        f"Question: {question}\nAnswer:"
-    )
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        messages = [
-            {"role": "system", "content": SYS_PROMPT},
-            {"role": "user", "content": user},
-        ]
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return f"### System:\n{SYS_PROMPT}\n\n### User:\n{user}\n\n### Assistant:"
+# 注意：保留 memqa prompt 构造（student 用）
+# teacher 使用 build_prompt(tokenizer, q, context)
 
-def build_training_pairs_for_doc(tokenizer, context: str, qas: List[dict], orig_q: str) -> List[Tuple[torch.LongTensor, torch.LongTensor]]:
-    pairs = []
+def build_training_pairs_for_doc(tokenizer, context: str, qas: List[dict], orig_q: str) -> List[Dict]:
+    pairs: List[Dict] = []
     orig_q_norm = normalize_text_for_key(orig_q or "")
     for qa in qas or []:
         q = (qa.get("q") or "").strip()
@@ -422,12 +477,18 @@ def build_training_pairs_for_doc(tokenizer, context: str, qas: List[dict], orig_
         prompt = build_memqa_prompt(tokenizer, q)
         pr_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
         ans_ids = tokenizer(a, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
-        pairs.append((pr_ids, ans_ids))
+        pairs.append({
+            "pr_ids": pr_ids,
+            "ans_ids": ans_ids,
+            "q_text": q,
+            "a_text": a,
+        })
     return pairs
 
 # =========================
 # Main
 # =========================
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
@@ -445,7 +506,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条（0 表示全量）")
 
     # mem 超参
-    ap.add_argument("--mem_len", type=int, default=1)
+    ap.add_argument("--mem_len", type=int, default=1, help="mem token 个数（可调）")
     ap.add_argument("--mem_steps", type=int, default=500)
     ap.add_argument("--mem_lr", type=float, default=1e-2)
     ap.add_argument("--mem_wd", type=float, default=1e-2)
@@ -460,6 +521,14 @@ def main():
 
     ap.add_argument("--max_ctx_tokens", type=int, default=1024)
     ap.add_argument("--ctx_window", type=str, default="keyword", choices=["keyword","head"])
+
+    # ===== 新增：KD 控制项 =====
+    ap.add_argument("--enable_kd", action="store_true", help="启用答案 token 的 logit 蒸馏")
+    ap.add_argument("--teacher_model", type=str, default=None, help="teacher 模型（默认与 student 相同）")
+    ap.add_argument("--kd_temp", type=float, default=2.0, help="KD 温度 T")
+    ap.add_argument("--kd_lambda", type=float, default=1.0, help="KD 损失权重")
+    ap.add_argument("--kd_first_k", type=int, default=0, help="前 K 个答案 token 额外加权（0 表示不加权）")
+    ap.add_argument("--kd_head_weight", type=float, default=1.0, help="首 K token 的额外权重系数（=1 表示无额外权重）")
 
     args = ap.parse_args()
 
@@ -478,6 +547,22 @@ def main():
     )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Teacher（可选）
+    teacher_model = None
+    teacher_tokenizer = None
+    if args.enable_kd:
+        t_model_name = args.teacher_model if args.teacher_model is not None else args.model
+        teacher_tokenizer = AutoTokenizer.from_pretrained(t_model_name, trust_remote_code=True)
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            t_model_name, torch_dtype=torch_dtype, device_map=device_map,
+            trust_remote_code=True, low_cpu_mem_usage=True,
+        )
+        if teacher_tokenizer.pad_token_id is None and teacher_tokenizer.eos_token_id is not None:
+            teacher_tokenizer.pad_token_id = teacher_tokenizer.eos_token_id
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
 
     raw = load_jsonl(args.raw_subset_file)
     aug = load_jsonl(args.aug_file)
@@ -534,12 +619,12 @@ def main():
         )
         ctx_ids_trunc = ctx_ids_trunc.to(model.device)
 
-        qa_pairs_ids = build_training_pairs_for_doc(tokenizer, ctx, d["qas"], q_orig)
+        qa_pairs = build_training_pairs_for_doc(tokenizer, ctx, d["qas"], q_orig)
 
         compressor = MemCompressor(model, tokenizer, mem_len=args.mem_len, enable_gc=args.enable_gc)
         recon_best = compressor.train_mem(
             ctx_ids=ctx_ids_trunc,
-            qa_pairs_ids=qa_pairs_ids,
+            qa_pairs=qa_pairs,
             steps=args.mem_steps,
             lr=args.mem_lr,
             weight_decay=args.mem_wd,
@@ -551,6 +636,14 @@ def main():
             noise_std=args.mem_noise,
             log_every=args.mem_log_every,
             verbose=args.verbose,
+            enable_kd=args.enable_kd,
+            context_text=ctx,
+            teacher_model=teacher_model,
+            teacher_tokenizer=teacher_tokenizer,
+            kd_temp=args.kd_temp,
+            kd_lambda=args.kd_lambda,
+            kd_first_k=args.kd_first_k,
+            kd_head_weight=args.kd_head_weight,
         )
 
         prompt_memqa = build_memqa_prompt(tokenizer, q_orig)
@@ -562,7 +655,7 @@ def main():
             pred1, f"{em1:.3f}", f"{f11:.3f}",
             pred2_span, f"{em2:.3f}", f"{f12:.3f}",
             pred_mem, f"{em3:.3f}", f"{f13:.3f}",
-            f"{recon_best:.3f}", len(qa_pairs_ids)
+            f"{recon_best:.3f}", len(qa_pairs)
         ])
         jsonl_rows.append({
             "id": i,
@@ -574,7 +667,7 @@ def main():
             "pred_with_mem": pred_mem, "em_with_mem": em3, "f1_with_mem": f13,
             "context_len_tokens": ctx_len_tokens_full,
             "mem_recon_acc": recon_best,
-            "mem_train_qa_used": len(qa_pairs_ids),
+            "mem_train_qa_used": len(qa_pairs),
             "mem_trunc_info": info,
         })
 
@@ -586,7 +679,7 @@ def main():
         torch.cuda.empty_cache()
 
         if args.verbose and (i+1) % 10 == 0:
-            print(f"[{i+1}/{len(docs)}] EM/F1(no-ctx)={em1:.0f}/{f11:.1f}  EM/F1(+ctx)={em2:.0f}/{f12:.1f}  EM/F1(+mem)={em3:.0f}/{f13:.1f}  recon={recon_best*100:.1f}%  trainQA={len(qa_pairs_ids)}")
+            print(f"[{i+1}/{len(docs)}] EM/F1(no-ctx)={em1:.0f}/{f11:.1f}  EM/F1(+ctx)={em2:.0f}/{f12:.1f}  EM/F1(+mem)={em3:.0f}/{f13:.1f}  recon={recon_best*100:.1f}%  trainQA={len(qa_pairs)}")
 
     N = max(1, len(rows))
     print("\n=== Final ===")
@@ -613,7 +706,8 @@ if __name__ == "__main__":
     main()
 
 """
-python -u train_nq_mem_joint.py \
+运行示例：
+python -u train_nq_mem_joint_kd.py \
   --model /home/syt/project/Cram/model/model_scope_model/llama3_1_8b_instruct \
   --raw_subset_file /home/syt/project/cram_L20/DOCAUG/data/nq_subset/raw/nq_subset_100.jsonl \
   --aug_file /home/syt/project/cram_L20/DOCAUG/data/nq_subset/augmented/nq_multiqa_only_no_unans_first100.jsonl \
@@ -621,7 +715,7 @@ python -u train_nq_mem_joint.py \
   --max_new_tokens 16 \
   --temperature 0.0 \
   --mem_len 1 \
-  --mem_steps 200 \
+  --mem_steps 400 \
   --mem_lr 1e-2 \
   --mem_wd 1e-2 \
   --alpha_start 0.8 \
@@ -631,9 +725,41 @@ python -u train_nq_mem_joint.py \
   --max_ctx_tokens 1024 \
   --ctx_window keyword \
   --enable_gc \
-  --csv_out runs/nq_joint_results_draft.csv \
-  --save_preds runs/nq_joint_preds_draft.jsonl \
+  --enable_kd \
+  --kd_temp 2.0 \
+  --kd_lambda 1.0 \
+  --kd_first_k 3 \
+  --kd_head_weight 2.0 \
+  --csv_out runs/nq_joint_results_kd400step.csv \
+  --save_preds runs/nq_joint_preds_kd400step.jsonl \
   --verbose \
   --limit 10
-
+  
+python -u train_nq_mem_joint_kd.py \
+  --model /home/syt/project/Cram/model/model_scope_model/llama3_1_8b_instruct \
+  --raw_subset_file /home/syt/project/cram_L20/DOCAUG/data/nq_subset/raw/nq_subset_100_dif.jsonl \
+  --aug_file /home/syt/project/cram_L20/DOCAUG/data/nq_subset/augmented/nq_multiqa_only_no_unans.jsonl \
+  --device cuda \
+  --max_new_tokens 16 \
+  --temperature 0.0 \
+  --mem_len 4 \
+  --mem_steps 400 \
+  --mem_lr 1e-2 \
+  --mem_wd 1e-2 \
+  --alpha_start 0.8 \
+  --alpha_end 0.4 \
+  --mem_l2 1e-4 \
+  --mem_noise 0.0 \
+  --max_ctx_tokens 1024 \
+  --ctx_window keyword \
+  --enable_gc \
+  --enable_kd \
+  --kd_temp 2.0 \
+  --kd_lambda 1.0 \
+  --kd_first_k 3 \
+  --kd_head_weight 2.0 \
+  --csv_out runs/nq_joint_results_kd400step4mem_dif.csv \
+  --save_preds runs/nq_joint_preds_kd400step4mem_dif.jsonl \
+  --verbose \
+  --limit 10
 """
